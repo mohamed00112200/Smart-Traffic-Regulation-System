@@ -1,0 +1,250 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+#include <RTClib.h>
+
+// Function prototypes
+void checkLaneOccupancy(bool forceUpdate = false);
+void handleGateControl();
+void assignLaneAndOpenGate();
+void checkForExitingCars();
+void handleExitingCar(int laneNumber, DateTime entryTime);
+void moveServoSmoothly(int targetAngle);
+void printTime(DateTime t);
+
+// Initialize LCD (I2C address, columns, rows)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Initialize Servo
+Servo gateServo;
+
+// Initialize RTC
+RTC_DS3231 rtc;
+
+// Define IR sensor pins
+const int gateIRSensor = 2;  // IR sensor at the gate
+const int lane1Sensor = 7;   // Lane 1 IR sensor
+const int lane2Sensor = 8;   // Lane 2 IR sensor
+const int lane3Sensor = 9;   // Lane 3 IR sensor
+
+// Define servo pin
+const int servoPin = 3;
+
+// Variables to store parking times
+DateTime lane1EntryTime, lane2EntryTime, lane3EntryTime;
+bool lane1Occupied = false, lane2Occupied = false, lane3Occupied = false;
+
+// Variables for gate control
+bool gateOpen = false;
+unsigned long carDetectionTime = 0;
+bool carWasDetected = false;
+int currentServoAngle = 0;  // Track current servo position
+
+const int MIN_PARKING_SECONDS_BEFORE_EXIT = 15;  // Minimum parking time before an exit is valid
+
+void setup() {
+  Serial.begin(9600);
+
+  // Initialize LCD
+  lcd.begin();
+  lcd.backlight();
+
+  // Attach servo to the pin
+  gateServo.attach(servoPin);
+  gateServo.write(0);  // Start with gate closed
+  currentServoAngle = 0;
+
+  // Initialize RTC
+  if (!rtc.begin()) {
+    lcd.print("RTC Error");
+    while (1)
+      ;
+  }
+
+  // Set IR sensor pins as input
+  pinMode(gateIRSensor, INPUT_PULLUP);  // Changed to INPUT_PULLUP for better stability
+  pinMode(lane1Sensor, INPUT);
+  pinMode(lane2Sensor, INPUT);
+  pinMode(lane3Sensor, INPUT);
+
+  // Display welcome message
+  lcd.setCursor(0, 0);
+  lcd.print("    Welcome");
+  delay(2000);
+  lcd.clear();
+
+  // Display initial free lanes
+  checkLaneOccupancy(true);
+}
+
+void loop() {
+  // Check lane occupancy and display free lanes
+  checkLaneOccupancy();
+
+  // Check if a car is at the gate
+  handleGateControl();
+
+  // Check if a car is exiting any lane
+  checkForExitingCars();
+
+  delay(100);  // Small delay to stabilize readings
+}
+
+// Move servo smoothly from current angle to target angle (1° steps)
+void moveServoSmoothly(int targetAngle) {
+  int step = (targetAngle > currentServoAngle) ? 1 : -1;
+  while (currentServoAngle != targetAngle) {
+    currentServoAngle += step;
+    gateServo.write(currentServoAngle);
+    delay(25);
+  }
+}
+
+void checkLaneOccupancy(bool forceUpdate = false) {
+  static unsigned long lastUpdate = 0;
+  unsigned long now = millis();
+
+  if (!forceUpdate && (now - lastUpdate < 1000)) {
+    return;  // Update only every second unless forced
+  }
+
+  lastUpdate = now;
+
+  int freeLanes = 0;
+  if (!lane1Occupied) freeLanes++;
+  if (!lane2Occupied) freeLanes++;
+  if (!lane3Occupied) freeLanes++;
+
+  lcd.setCursor(0, 0);
+  lcd.print("Free Lanes: ");
+  lcd.print(freeLanes);
+  lcd.print("    ");  // Clear remaining characters
+}
+
+void handleGateControl() {
+  bool carDetected = (digitalRead(gateIRSensor) == LOW);
+
+  if (carDetected && !carWasDetected) {
+    delay(1500);  // Confirm detection
+    carDetected = (digitalRead(gateIRSensor) == LOW);
+
+    if (carDetected) {
+      carWasDetected = true;
+      carDetectionTime = millis();
+
+      // Check if all lanes are occupied
+      if (lane1Occupied && lane2Occupied && lane3Occupied) {
+        lcd.clear();
+        lcd.print("No Free Lanes");
+        delay(2000);  // Display the message for 2 seconds
+        lcd.setCursor(0, 0);
+        lcd.print("come back later");
+        delay(2000);  // Display the message for 2 seconds
+        carWasDetected = false;  // Reset car detection
+      } else {
+        assignLaneAndOpenGate();
+      }
+    }
+  } else if (!carDetected && carWasDetected) {
+    if (gateOpen && (millis() - carDetectionTime >= 6000)) {  // Delay increased to 6 seconds
+      moveServoSmoothly(0);                                   // Close gate
+      gateOpen = false;
+      carWasDetected = false;
+    }
+  }
+}
+
+void assignLaneAndOpenGate() {
+  lcd.clear();
+
+  if (!lane1Occupied) {
+    lane1Occupied = true;
+    lane1EntryTime = rtc.now();
+  } else if (!lane2Occupied) {
+    lane2Occupied = true;
+    lane2EntryTime = rtc.now();
+  } else if (!lane3Occupied) {
+    lane3Occupied = true;
+    lane3EntryTime = rtc.now();
+  }
+
+  checkLaneOccupancy(true);  // Update occupancy after assignment
+  lcd.print("Lane Assigned");
+  lcd.setCursor(0, 1);
+  lcd.print("Opening Gate...");
+  delay(1500);
+  moveServoSmoothly(60);  // Open gate
+  gateOpen = true;
+  lcd.setCursor(0, 1);
+  lcd.print("                         ");
+}
+
+void checkForExitingCars() {
+  DateTime now = rtc.now();
+  bool laneFreed = false;
+
+  if (lane1Occupied && digitalRead(lane1Sensor) == HIGH) {
+    if ((now.unixtime() - lane1EntryTime.unixtime()) > MIN_PARKING_SECONDS_BEFORE_EXIT) {
+      handleExitingCar(1, lane1EntryTime);
+      lane1Occupied = false;
+      laneFreed = true;
+    }
+  }
+
+  if (lane2Occupied && digitalRead(lane2Sensor) == HIGH) {
+    if ((now.unixtime() - lane2EntryTime.unixtime()) > MIN_PARKING_SECONDS_BEFORE_EXIT) {
+      handleExitingCar(2, lane2EntryTime);
+      lane2Occupied = false;
+      laneFreed = true;
+    }
+  }
+
+  if (lane3Occupied && digitalRead(lane3Sensor) == HIGH) {
+    if ((now.unixtime() - lane3EntryTime.unixtime()) > MIN_PARKING_SECONDS_BEFORE_EXIT) {
+      handleExitingCar(3, lane3EntryTime);
+      lane3Occupied = false;
+      laneFreed = true;
+    }
+  }
+
+  if (laneFreed) {
+    checkLaneOccupancy(true);  // Update display immediately
+  }
+}
+
+void handleExitingCar(int laneNumber, DateTime entryTime) {
+  DateTime exitTime = rtc.now();
+  unsigned long parkingDuration = exitTime.unixtime() - entryTime.unixtime();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("In:");
+  printTime(entryTime);
+  lcd.setCursor(0, 1);
+  lcd.print("Out:");
+  printTime(exitTime);
+  delay(3000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Lane ");
+  lcd.print(laneNumber);
+  lcd.print(" Duration: ");
+  lcd.setCursor(0, 1);
+  lcd.print(parkingDuration);
+  lcd.print(" sec");
+  delay(3000);
+
+  lcd.clear();
+}
+
+void printTime(DateTime t) {
+  if (t.hour() < 10) lcd.print('0');
+  lcd.print(t.hour());
+  lcd.print(':');
+  if (t.minute() < 10) lcd.print('0');
+  lcd.print(t.minute());
+  lcd.print(':');
+  if (t.second() < 10) lcd.print('0');
+  lcd.print(t.second());
+}
